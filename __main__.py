@@ -20,11 +20,29 @@ Subdomain routing (all -> ALB):
   ozone.amrx.xyz        -> proxy -> O3 frontend   /openmrs/spa
   openmrs.amrx.xyz      -> proxy -> OpenMRS REST   /openmrs
   odoo.amrx.xyz         -> odoo  :8069
+
+Secrets are injected at deploy time via Pulumi ESC (esc/dev.yaml),
+which pulls them from AWS Secrets Manager. No secrets are hardcoded here.
 """
 
 import json
 import pulumi
 import pulumi_aws as aws
+
+# -- Config / Secrets (injected by Pulumi ESC) ---------------------------------
+cfg = pulumi.Config("ozone")
+
+PG_USERNAME            = cfg.get("pgUsername")          or "ozone"
+PG_PASSWORD            = cfg.require_secret("pgPassword")
+
+MYSQL_USERNAME         = cfg.get("mysqlUsername")       or "openmrs"
+MYSQL_PASSWORD         = cfg.require_secret("mysqlPassword")
+
+OPENMRS_ADMIN_PASSWORD = cfg.require_secret("openMrsAdminPassword")
+ODOO_ADMIN_PASSWORD    = cfg.require_secret("odooAdminPassword")
+
+EIP_OPENMRS_PASSWORD   = cfg.require_secret("eipOpenMrsPassword")
+EIP_ODOO_PASSWORD      = cfg.require_secret("eipOdooPassword")
 
 # -- Tags applied to every resource --------------------------------------------
 TAGS = {
@@ -194,7 +212,7 @@ rds_subnet_group = aws.rds.SubnetGroup(
     tags={**TAGS, "Name": "ozone-dev-rds-subnet-group"},
 )
 
-pg_db = aws.rds.Instance(
+pg_db = PG_PASSWORD.apply(lambda pg_pwd: aws.rds.Instance(
     "ozone-postgres",
     identifier="ozone-dev-postgres",
     engine="postgres",
@@ -203,8 +221,8 @@ pg_db = aws.rds.Instance(
     allocated_storage=20,
     storage_type="gp3",
     db_name="ozone",
-    username="ozone",
-    password="OzoneRDS!Pg2024",
+    username=PG_USERNAME,
+    password=pg_pwd,
     db_subnet_group_name=rds_subnet_group.name,
     vpc_security_group_ids=[rds_sg.id],
     skip_final_snapshot=True,
@@ -212,7 +230,7 @@ pg_db = aws.rds.Instance(
     publicly_accessible=False,
     multi_az=False,
     tags={**TAGS, "Name": "ozone-dev-postgres"},
-)
+))
 
 # -- RDS - Aurora MySQL Serverless v2 (for OpenMRS) ----------------------------
 
@@ -222,15 +240,15 @@ mysql_subnet_group = aws.rds.SubnetGroup(
     tags={**TAGS, "Name": "ozone-dev-mysql-subnet-group"},
 )
 
-aurora_cluster = aws.rds.Cluster(
+aurora_cluster = MYSQL_PASSWORD.apply(lambda mysql_pwd: aws.rds.Cluster(
     "ozone-aurora-mysql",
     cluster_identifier="ozone-dev-mysql",
     engine="aurora-mysql",
     engine_version="8.0.mysql_aurora.3.12.0",
     engine_mode="provisioned",
     database_name="openmrs",
-    master_username="openmrs",
-    master_password="OzoneAurora!My2024",
+    master_username=MYSQL_USERNAME,
+    master_password=mysql_pwd,
     db_subnet_group_name=mysql_subnet_group.name,
     vpc_security_group_ids=[mysql_sg.id],
     skip_final_snapshot=True,
@@ -240,18 +258,18 @@ aurora_cluster = aws.rds.Cluster(
         max_capacity=4.0,
     ),
     tags={**TAGS, "Name": "ozone-dev-aurora-mysql"},
-)
+))
 
-aurora_instance = aws.rds.ClusterInstance(
+aurora_instance = aurora_cluster.apply(lambda cluster: aws.rds.ClusterInstance(
     "ozone-aurora-mysql-instance",
-    cluster_identifier=aurora_cluster.id,
+    cluster_identifier=cluster.id,
     identifier="ozone-dev-mysql-1",
     instance_class="db.serverless",
-    engine=aurora_cluster.engine,
-    engine_version=aurora_cluster.engine_version,
+    engine=cluster.engine,
+    engine_version=cluster.engine_version,
     db_subnet_group_name=mysql_subnet_group.name,
     tags={**TAGS, "Name": "ozone-dev-aurora-mysql-1"},
-)
+))
 
 # -- EFS - shared persistent volume for OpenMRS modules + Odoo addons ----------
 
@@ -418,7 +436,12 @@ def efs_volume(name, access_point_id=None):
 
 
 # -- Task: OpenMRS backend ------------------------------------------------------
-openmrs_td = aws.ecs.TaskDefinition(
+openmrs_td = pulumi.Output.all(
+    pg_host=pg_db.address,
+    my_host=aurora_cluster.endpoint,
+    mysql_pwd=MYSQL_PASSWORD,
+    omrs_admin_pwd=OPENMRS_ADMIN_PASSWORD,
+).apply(lambda args: aws.ecs.TaskDefinition(
     "ozone-td-openmrs",
     family="ozone-dev-openmrs",
     cpu="1024",
@@ -426,48 +449,48 @@ openmrs_td = aws.ecs.TaskDefinition(
     network_mode="awsvpc",
     requires_compatibilities=["FARGATE"],
     execution_role_arn=exec_role.arn,
-    container_definitions=pulumi.Output.all(
-        pg_host=pg_db.address,
-        my_host=aurora_cluster.endpoint,
-    ).apply(lambda args: json.dumps([
+    container_definitions=json.dumps([
         {
             "name": "openmrs",
             "image": OPENMRS_BACKEND_IMAGE,
             "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
             "environment": [
-                {"name": "OMRS_DB_HOSTNAME",   "value": args["my_host"]},
-                {"name": "OMRS_DB_PORT",        "value": "3306"},
-                {"name": "OMRS_DB_NAME",        "value": "openmrs"},
-                {"name": "OMRS_DB_USERNAME",    "value": "openmrs"},
-                {"name": "OMRS_DB_PASSWORD",    "value": "OzoneAurora!My2024"},
-                {"name": "OMRS_CREATE_TABLES",  "value": "true"},
-                {"name": "OMRS_AUTO_UPDATE_DATABASE", "value": "true"},
-                {"name": "OMRS_MODULE_WEB_ADMIN", "value": "false"},
-                {"name": "JAVA_OPTS",           "value": "-Xmx1500m -Xms512m"},
+                {"name": "OMRS_DB_HOSTNAME",          "value": args["my_host"]},
+                {"name": "OMRS_DB_PORT",               "value": "3306"},
+                {"name": "OMRS_DB_NAME",               "value": "openmrs"},
+                {"name": "OMRS_DB_USERNAME",           "value": MYSQL_USERNAME},
+                {"name": "OMRS_DB_PASSWORD",           "value": args["mysql_pwd"]},
+                {"name": "OMRS_CREATE_TABLES",         "value": "true"},
+                {"name": "OMRS_AUTO_UPDATE_DATABASE",  "value": "true"},
+                {"name": "OMRS_MODULE_WEB_ADMIN",      "value": "false"},
+                {"name": "JAVA_OPTS",                  "value": "-Xmx1500m -Xms512m"},
             ],
             "logConfiguration": {
                 "logDriver": "awslogs",
                 "options": {
-                    "awslogs-group":  "/ozone-dev/openmrs",
-                    "awslogs-region": "us-east-2",
+                    "awslogs-group":         "/ozone-dev/openmrs",
+                    "awslogs-region":        "us-east-2",
                     "awslogs-stream-prefix": "openmrs",
                 },
             },
             "essential": True,
             "healthCheck": {
-                "command": ["CMD-SHELL", "curl -fs http://localhost:8080/openmrs/health || exit 1"],
-                "interval": 60,
-                "timeout": 30,
-                "retries": 5,
+                "command":     ["CMD-SHELL", "curl -fs http://localhost:8080/openmrs/health || exit 1"],
+                "interval":    60,
+                "timeout":     30,
+                "retries":     5,
                 "startPeriod": 180,
             },
         }
-    ])),
+    ]),
     tags={**TAGS, "Name": "ozone-dev-td-openmrs"},
-)
+))
 
 # -- Task: Odoo ERP -------------------------------------------------------------
-odoo_td = aws.ecs.TaskDefinition(
+odoo_td = pulumi.Output.all(
+    pg_host=pg_db.address,
+    pg_pwd=PG_PASSWORD,
+).apply(lambda args: aws.ecs.TaskDefinition(
     "ozone-td-odoo",
     family="ozone-dev-odoo",
     cpu="1024",
@@ -475,43 +498,46 @@ odoo_td = aws.ecs.TaskDefinition(
     network_mode="awsvpc",
     requires_compatibilities=["FARGATE"],
     execution_role_arn=exec_role.arn,
-    container_definitions=pulumi.Output.all(pg_host=pg_db.address).apply(
-        lambda args: json.dumps([
-            {
-                "name": "odoo",
-                "image": ODOO_IMAGE,
-                "portMappings": [{"containerPort": 8069, "protocol": "tcp"}],
-                "environment": [
-                    {"name": "HOST",     "value": args["pg_host"]},
-                    {"name": "PORT",     "value": "5432"},
-                    {"name": "USER",     "value": "ozone"},
-                    {"name": "PASSWORD", "value": "OzoneRDS!Pg2024"},
-                    {"name": "DB_NAME",  "value": "odoo"},
-                ],
-                "logConfiguration": {
-                    "logDriver": "awslogs",
-                    "options": {
-                        "awslogs-group":  "/ozone-dev/odoo",
-                        "awslogs-region": "us-east-2",
-                        "awslogs-stream-prefix": "odoo",
-                    },
+    container_definitions=json.dumps([
+        {
+            "name": "odoo",
+            "image": ODOO_IMAGE,
+            "portMappings": [{"containerPort": 8069, "protocol": "tcp"}],
+            "environment": [
+                {"name": "HOST",     "value": args["pg_host"]},
+                {"name": "PORT",     "value": "5432"},
+                {"name": "USER",     "value": PG_USERNAME},
+                {"name": "PASSWORD", "value": args["pg_pwd"]},
+                {"name": "DB_NAME",  "value": "odoo"},
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group":         "/ozone-dev/odoo",
+                    "awslogs-region":        "us-east-2",
+                    "awslogs-stream-prefix": "odoo",
                 },
-                "essential": True,
-                "healthCheck": {
-                    "command": ["CMD-SHELL", "curl -fs http://localhost:8069/web/health || exit 1"],
-                    "interval": 30,
-                    "timeout": 10,
-                    "retries": 5,
-                    "startPeriod": 120,
-                },
-            }
-        ])
-    ),
+            },
+            "essential": True,
+            "healthCheck": {
+                "command":     ["CMD-SHELL", "curl -fs http://localhost:8069/web/health || exit 1"],
+                "interval":    30,
+                "timeout":     10,
+                "retries":     5,
+                "startPeriod": 120,
+            },
+        }
+    ]),
     tags={**TAGS, "Name": "ozone-dev-td-odoo"},
-)
+))
 
 # -- Task: EIP Odoo <-> OpenMRS bridge -------------------------------------------
-eip_td = aws.ecs.TaskDefinition(
+eip_td = pulumi.Output.all(
+    pg_host=pg_db.address,
+    pg_pwd=PG_PASSWORD,
+    eip_omrs_pwd=EIP_OPENMRS_PASSWORD,
+    eip_odoo_pwd=EIP_ODOO_PASSWORD,
+).apply(lambda args: aws.ecs.TaskDefinition(
     "ozone-td-eip-odoo",
     family="ozone-dev-eip-odoo",
     cpu="512",
@@ -519,38 +545,36 @@ eip_td = aws.ecs.TaskDefinition(
     network_mode="awsvpc",
     requires_compatibilities=["FARGATE"],
     execution_role_arn=exec_role.arn,
-    container_definitions=pulumi.Output.all(pg_host=pg_db.address).apply(
-        lambda args: json.dumps([
-            {
-                "name": "eip-odoo-openmrs",
-                "image": EIP_ODOO_IMAGE,
-                "environment": [
-                    {"name": "OPENMRS_URL",          "value": "http://openmrs.ozone-dev.local:8080/openmrs"},
-                    {"name": "OPENMRS_USER",         "value": "admin"},
-                    {"name": "OPENMRS_PASSWORD",     "value": "Admin123"},
-                    {"name": "ODOO_URL",             "value": "http://odoo.ozone-dev.local:8069"},
-                    {"name": "ODOO_DB",              "value": "odoo"},
-                    {"name": "ODOO_USER",            "value": "admin"},
-                    {"name": "ODOO_PASSWORD",        "value": "admin"},
-                    {"name": "EIP_DB_DRIVER",        "value": "org.postgresql.Driver"},
-                    {"name": "EIP_DB_URL",           "value": f"jdbc:postgresql://{args['pg_host']}:5432/eip"},
-                    {"name": "EIP_DB_USER",          "value": "ozone"},
-                    {"name": "EIP_DB_PASSWORD",      "value": "OzoneRDS!Pg2024"},
-                ],
-                "logConfiguration": {
-                    "logDriver": "awslogs",
-                    "options": {
-                        "awslogs-group":  "/ozone-dev/eip-odoo",
-                        "awslogs-region": "us-east-2",
-                        "awslogs-stream-prefix": "eip-odoo",
-                    },
+    container_definitions=json.dumps([
+        {
+            "name": "eip-odoo-openmrs",
+            "image": EIP_ODOO_IMAGE,
+            "environment": [
+                {"name": "OPENMRS_URL",      "value": "http://openmrs.ozone-dev.local:8080/openmrs"},
+                {"name": "OPENMRS_USER",     "value": "admin"},
+                {"name": "OPENMRS_PASSWORD", "value": args["eip_omrs_pwd"]},
+                {"name": "ODOO_URL",         "value": "http://odoo.ozone-dev.local:8069"},
+                {"name": "ODOO_DB",          "value": "odoo"},
+                {"name": "ODOO_USER",        "value": "admin"},
+                {"name": "ODOO_PASSWORD",    "value": args["eip_odoo_pwd"]},
+                {"name": "EIP_DB_DRIVER",    "value": "org.postgresql.Driver"},
+                {"name": "EIP_DB_URL",       "value": f"jdbc:postgresql://{args['pg_host']}:5432/eip"},
+                {"name": "EIP_DB_USER",      "value": PG_USERNAME},
+                {"name": "EIP_DB_PASSWORD",  "value": args["pg_pwd"]},
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group":         "/ozone-dev/eip-odoo",
+                    "awslogs-region":        "us-east-2",
+                    "awslogs-stream-prefix": "eip-odoo",
                 },
-                "essential": True,
-            }
-        ])
-    ),
+            },
+            "essential": True,
+        }
+    ]),
     tags={**TAGS, "Name": "ozone-dev-td-eip-odoo"},
-)
+))
 
 # -- Task: Nginx reverse proxy (O3 frontend + path routing) --------------------
 proxy_td = aws.ecs.TaskDefinition(
@@ -575,8 +599,8 @@ proxy_td = aws.ecs.TaskDefinition(
             "logConfiguration": {
                 "logDriver": "awslogs",
                 "options": {
-                    "awslogs-group":  "/ozone-dev/proxy",
-                    "awslogs-region": "us-east-2",
+                    "awslogs-group":         "/ozone-dev/proxy",
+                    "awslogs-region":        "us-east-2",
                     "awslogs-stream-prefix": "proxy",
                 },
             },
@@ -621,11 +645,13 @@ common_net = aws.ecs.ServiceNetworkConfigurationArgs(
     security_groups=[ecs_sg.id],
 )
 
-svc_openmrs = aws.ecs.Service(
+svc_openmrs = pulumi.Output.all(
+    td_arn=openmrs_td.apply(lambda td: td.arn),
+).apply(lambda args: aws.ecs.Service(
     "ozone-svc-openmrs",
     name="ozone-dev-openmrs",
     cluster=cluster.arn,
-    task_definition=openmrs_td.arn,
+    task_definition=args["td_arn"],
     desired_count=1,
     launch_type="FARGATE",
     network_configuration=common_net,
@@ -640,13 +666,15 @@ svc_openmrs = aws.ecs.Service(
     ),
     tags={**TAGS, "Name": "ozone-dev-svc-openmrs"},
     opts=pulumi.ResourceOptions(depends_on=[aurora_instance, listener_http]),
-)
+))
 
-svc_odoo = aws.ecs.Service(
+svc_odoo = pulumi.Output.all(
+    td_arn=odoo_td.apply(lambda td: td.arn),
+).apply(lambda args: aws.ecs.Service(
     "ozone-svc-odoo",
     name="ozone-dev-odoo",
     cluster=cluster.arn,
-    task_definition=odoo_td.arn,
+    task_definition=args["td_arn"],
     desired_count=1,
     launch_type="FARGATE",
     network_configuration=common_net,
@@ -661,19 +689,21 @@ svc_odoo = aws.ecs.Service(
     ),
     tags={**TAGS, "Name": "ozone-dev-svc-odoo"},
     opts=pulumi.ResourceOptions(depends_on=[pg_db, listener_http]),
-)
+))
 
-svc_eip = aws.ecs.Service(
+svc_eip = pulumi.Output.all(
+    td_arn=eip_td.apply(lambda td: td.arn),
+).apply(lambda args: aws.ecs.Service(
     "ozone-svc-eip-odoo",
     name="ozone-dev-eip-odoo",
     cluster=cluster.arn,
-    task_definition=eip_td.arn,
+    task_definition=args["td_arn"],
     desired_count=1,
     launch_type="FARGATE",
     network_configuration=common_net,
     tags={**TAGS, "Name": "ozone-dev-svc-eip-odoo"},
     opts=pulumi.ResourceOptions(depends_on=[svc_openmrs, svc_odoo]),
-)
+))
 
 svc_proxy = aws.ecs.Service(
     "ozone-svc-proxy",
@@ -698,12 +728,12 @@ svc_proxy = aws.ecs.Service(
 
 # -- Outputs -------------------------------------------------------------------
 
-pulumi.export("alb_dns_name",         alb.dns_name)
-pulumi.export("vpc_id",               vpc.id)
-pulumi.export("ecs_cluster",          cluster.name)
-pulumi.export("rds_postgres_host",    pg_db.address)
-pulumi.export("rds_aurora_mysql_host",aurora_cluster.endpoint)
-pulumi.export("efs_id",               efs.id)
+pulumi.export("alb_dns_name",          alb.dns_name)
+pulumi.export("vpc_id",                vpc.id)
+pulumi.export("ecs_cluster",           cluster.name)
+pulumi.export("rds_postgres_host",     pg_db.address)
+pulumi.export("rds_aurora_mysql_host", aurora_cluster.endpoint)
+pulumi.export("efs_id",                efs.id)
 
 pulumi.export("dns_records_to_create", pulumi.Output.concat(
     "Add these CNAME records in Route 53 / DNS provider (all -> ", alb.dns_name, "):\n"

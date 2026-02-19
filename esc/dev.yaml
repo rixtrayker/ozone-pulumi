@@ -1,0 +1,99 @@
+# Pulumi ESC Environment: ozone-his/dev
+#
+# This environment pulls secrets from AWS Secrets Manager and exposes them
+# as Pulumi config values consumed by the ozone-his stack.
+#
+# To create the environment:
+#   pulumi env init ozone-his/dev
+#   pulumi env edit ozone-his/dev  (paste this file's content)
+#
+# AWS Secrets Manager secrets expected (create once with the AWS CLI):
+#   aws secretsmanager create-secret --name ozone/dev/postgres  \
+#       --secret-string '{"password":"<your-pg-password>","username":"ozone"}'
+#
+#   aws secretsmanager create-secret --name ozone/dev/aurora-mysql \
+#       --secret-string '{"password":"<your-mysql-password>","username":"openmrs"}'
+#
+#   aws secretsmanager create-secret --name ozone/dev/openmrs-admin \
+#       --secret-string '{"password":"<your-admin-password>"}'
+#
+#   aws secretsmanager create-secret --name ozone/dev/odoo-admin \
+#       --secret-string '{"password":"<your-odoo-admin-password>"}'
+#
+#   aws secretsmanager create-secret --name ozone/dev/eip-odoo \
+#       --secret-string '{"openmrs_password":"<pwd>","odoo_password":"<pwd>"}'
+
+values:
+  aws:
+    login:
+      fn::open::aws-login:
+        oidc:
+          duration: 1h
+          roleArn: ${pulumi.esc.roleArn}
+          sessionName: pulumi-esc-ozone-dev
+
+  # ── Pull secrets from AWS Secrets Manager ──────────────────────────────────
+  secrets:
+    postgres:
+      fn::open::aws-secrets:
+        region: us-east-2
+        get:
+          ozone-pg:
+            secretId: ozone/dev/postgres
+
+    aurora:
+      fn::open::aws-secrets:
+        region: us-east-2
+        get:
+          ozone-mysql:
+            secretId: ozone/dev/aurora-mysql
+
+    openmrs_admin:
+      fn::open::aws-secrets:
+        region: us-east-2
+        get:
+          admin:
+            secretId: ozone/dev/openmrs-admin
+
+    odoo_admin:
+      fn::open::aws-secrets:
+        region: us-east-2
+        get:
+          admin:
+            secretId: ozone/dev/odoo-admin
+
+    eip:
+      fn::open::aws-secrets:
+        region: us-east-2
+        get:
+          bridge:
+            secretId: ozone/dev/eip-odoo
+
+  # ── Expose as Pulumi config (pulumiConfig keys become stack config) ─────────
+  pulumiConfig:
+    # Static / non-secret config
+    aws:region:          us-east-2
+    ozone:pgUsername:    ${secrets.postgres.ozone-pg.username}
+    ozone:mysqlUsername: ${secrets.aurora.ozone-mysql.username}
+
+    # Secrets (marked secret: true so they are encrypted in state)
+    ozone:pgPassword:
+      fn::secret: ${secrets.postgres.ozone-pg.password}
+    ozone:mysqlPassword:
+      fn::secret: ${secrets.aurora.ozone-mysql.password}
+    ozone:openMrsAdminPassword:
+      fn::secret: ${secrets.openmrs_admin.admin.password}
+    ozone:odooAdminPassword:
+      fn::secret: ${secrets.odoo_admin.admin.password}
+    ozone:eipOpenMrsPassword:
+      fn::secret: ${secrets.eip.bridge.openmrs_password}
+    ozone:eipOdooPassword:
+      fn::secret: ${secrets.eip.bridge.odoo_password}
+
+  # ── Expose AWS credentials to the Pulumi CLI automatically ─────────────────
+  environmentVariables:
+    AWS_ACCESS_KEY_ID:     ${aws.login.accessKeyId}
+    AWS_SECRET_ACCESS_KEY:
+      fn::secret: ${aws.login.secretAccessKey}
+    AWS_SESSION_TOKEN:
+      fn::secret: ${aws.login.sessionToken}
