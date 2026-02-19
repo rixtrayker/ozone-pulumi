@@ -1,0 +1,7 @@
+name: ozone-his
+description: Ozone HIS - ECS Fargate + RDS PostgreSQL on AWS us-east-2
+runtime: python
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: aws-python

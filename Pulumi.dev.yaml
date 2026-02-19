@@ -1,0 +1,4 @@
+config:
+  aws:region: us-east-2
+  aws:profile: Sij
+encryptionsalt: v1:0u5SvuLuwG4=:v1:nfrw9HOnh3LCG1mI:lTw2g2W8BAxUIlEIcCmjLsOCy1TsfA==
