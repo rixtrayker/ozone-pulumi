@@ -229,6 +229,7 @@ pg_db = PG_PASSWORD.apply(lambda pg_pwd: aws.rds.Instance(
     deletion_protection=False,
     publicly_accessible=False,
     multi_az=False,
+    backup_retention_period=7,
     tags={**TAGS, "Name": "ozone-dev-postgres"},
 ))
 
@@ -253,6 +254,7 @@ aurora_cluster = MYSQL_PASSWORD.apply(lambda mysql_pwd: aws.rds.Cluster(
     vpc_security_group_ids=[mysql_sg.id],
     skip_final_snapshot=True,
     deletion_protection=False,
+    backup_retention_period=7,
     serverlessv2_scaling_configuration=aws.rds.ClusterServerlessv2ScalingConfigurationArgs(
         min_capacity=0.5,
         max_capacity=4.0,

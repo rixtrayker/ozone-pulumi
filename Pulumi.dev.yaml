@@ -1,12 +1,20 @@
 config:
   aws:region: us-east-2
   aws:profile: Sij
-
-# Pulumi ESC environment that injects secrets + AWS credentials at runtime.
-# The environment is defined in esc/dev.yaml and must be created in Pulumi Cloud:
-#   pulumi env init <your-org>/ozone-his/dev
-#   pulumi env edit <your-org>/ozone-his/dev
-# Then link it to this stack:
-#   pulumi config env add <your-org>/ozone-his/dev --stack dev
-environment:
-  - ozone-his/dev
+  ozone:pgPassword:
+    secure: AAABAAN5neDoSOh329xbOtV+TcIjxqx9WbNBznQ8v8coZqdt0NrKQCWfYToqfhk=
+  ozone:pgUsername: ozone
+  ozone:mysqlPassword:
+    secure: AAABALD4B7NDaWwTqqwAY1I4kzlLQaZjU52BRCefb6CCgZl8ERYvIkwNuBOvcj4xnA4=
+  ozone:mysqlUsername: openmrs
+  ozone:openMrsAdminPassword:
+    secure: AAABAMEQInDal31ol6jPNJYwAag+ZR+0FcgfXZXYMN/sHJJzC0ijNg==
+  ozone:odooAdminPassword:
+    secure: AAABAF2EyxTofNZiCypRz0hUwc9jnc2EchiQc1G5WGhwUWxHsQ==
+  ozone:eipOpenMrsPassword:
+    secure: AAABAAPUkZmAeGyHtbhqSKfh53xRSbwego4Kcafk3Xyv3HwuBA3Ayw==
+  ozone:eipOdooPassword:
+    secure: AAABAN1Ac70ZzjSBAYAUXwWhz3gztxRcj04sCfQzK9Usr5DjQw==
+# ESC environment (optional - activate after setting up OIDC in AWS):
+# environment:
+#   - rixtrayker-org/ozone-his/dev
